@@ -57,9 +57,9 @@ impl Default for WorksheetConfig {
         Self {
             title: "六年级口算与计算练习".to_string(),
             subtitle: "姓名：__________    班级：__________    日期：__________".to_string(),
-            counts: [24, 12, 12, 10, 10],
+            counts: [24, 11, 11, 8, 8],
             columns: 2,
-            target_pages: 1,
+            target_pages: 2,
             seed: default_seed(),
             show_answers: false,
         }
