@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,6 +74,13 @@ fn default_seed() -> u64 {
         .unwrap_or(1)
 }
 
+/// How many times to retry a duplicate prompt before accepting it.
+///
+/// Pools per template are bounded (see the `generate_*_problem` arms), so a
+/// hard cap keeps generation O(count) even when a section's distinct-prompt
+/// space is genuinely smaller than the requested count.
+const DEDUP_MAX_ATTEMPTS: usize = 64;
+
 pub fn generate_worksheet(config: &WorksheetConfig) -> Worksheet {
     let mut rng = SimpleRng::new(config.seed);
     let section_kinds = [
@@ -89,15 +97,34 @@ pub fn generate_worksheet(config: &WorksheetConfig) -> Worksheet {
         if count == 0 {
             continue;
         }
-        let problems = (0..count)
-            .map(|_| match kind {
+        let mut problems = Vec::with_capacity(count);
+        let mut seen: HashSet<String> = HashSet::with_capacity(count);
+
+        while problems.len() < count {
+            let mut chosen: Option<Problem> = None;
+            for _ in 0..DEDUP_MAX_ATTEMPTS {
+                let candidate = match kind {
+                    SectionKind::Direct => generate_direct_problem(&mut rng),
+                    SectionKind::Vertical => generate_vertical_problem(&mut rng),
+                    SectionKind::Simplified => generate_simplified_problem(&mut rng),
+                    SectionKind::Conversion => generate_conversion_problem(&mut rng),
+                    SectionKind::Ratio => generate_ratio_problem(&mut rng),
+                };
+                if !seen.contains(&candidate.prompt) {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            let problem = chosen.unwrap_or_else(|| match kind {
                 SectionKind::Direct => generate_direct_problem(&mut rng),
                 SectionKind::Vertical => generate_vertical_problem(&mut rng),
                 SectionKind::Simplified => generate_simplified_problem(&mut rng),
                 SectionKind::Conversion => generate_conversion_problem(&mut rng),
                 SectionKind::Ratio => generate_ratio_problem(&mut rng),
-            })
-            .collect();
+            });
+            seen.insert(problem.prompt.clone());
+            problems.push(problem);
+        }
         sections.push(Section { kind, problems });
     }
 
@@ -270,14 +297,19 @@ fn generate_direct_problem(rng: &mut SimpleRng) -> Problem {
             }
         }
         _ => {
-            let left = Fraction::new(
-                [1, 3, 5][rng.gen_range(0, 3)] as i64,
-                [4, 5, 8][rng.gen_range(0, 3)] as i64,
-            );
-            let right = Fraction::new([1, 2, 3][rng.gen_range(0, 3)] as i64, left.denominator);
-            let result = left - right;
+            // Pick proper-fraction operands with a common denominator and a strictly
+            // larger left numerator. Format the prompt directly with the chosen
+            // numerator/denominator so Fraction::new's reduction (which would
+            // collapse e.g. 5/5 to "1") never bleeds into the prompt text.
+            let denominator = [4, 5, 6, 8, 10, 12][rng.gen_range(0, 6)] as i64;
+            let left_num = rng.gen_range(2, denominator as usize) as i64;
+            let right_num = rng.gen_range(1, left_num as usize) as i64;
+            let result = Fraction::new(left_num - right_num, denominator);
             Problem {
-                prompt: format!("{} - {} = ", left, right),
+                prompt: format!(
+                    "{}/{} - {}/{} = ",
+                    left_num, denominator, right_num, denominator
+                ),
                 answer: result.to_string(),
             }
         }
@@ -304,7 +336,8 @@ fn generate_vertical_problem(rng: &mut SimpleRng) -> Problem {
         }
         1 => {
             let left = Fraction::new([1, 3, 5][rng.gen_range(0, 3)] as i64, 4);
-            let mid = Fraction::new([1, 2, 3][rng.gen_range(0, 3)] as i64, 2);
+            // Odd numerators so Fraction::new(_, 2) can't reduce to "1" in prompt.
+            let mid = Fraction::new([1, 3, 5][rng.gen_range(0, 3)] as i64, 2);
             let right = Fraction::new([1, 2][rng.gen_range(0, 2)] as i64, 3);
             let answer = left + mid * right;
             Problem {
@@ -328,13 +361,20 @@ fn generate_vertical_problem(rng: &mut SimpleRng) -> Problem {
             }
         }
         3 => {
-            let a = [12, 18, 24][rng.gen_range(0, 3)];
-            let b = [3, 6][rng.gen_range(0, 2)];
-            let c = [2, 4, 8][rng.gen_range(0, 3)];
-            let d = [1, 2, 3][rng.gen_range(0, 3)];
+            // Build (a, b, c) so that c divides (a + b) exactly. The legacy form
+            // sampled a, b, c independently and used integer division, which
+            // silently truncated remainders (e.g. (24+3)÷8×3 → 9 instead of
+            // 10.125). Sampling parametrically keeps integer arithmetic exact.
+            let c = [2_i32, 3, 4, 5, 6][rng.gen_range(0, 5)];
+            let q = rng.gen_range(3, 9) as i32;
+            let total = c * q;
+            let max_b = ((total - 1) / 2).max(1);
+            let b = rng.gen_range(1, max_b as usize + 1) as i32;
+            let a = total - b;
+            let d = [2_i32, 3, 4, 5][rng.gen_range(0, 4)];
             Problem {
                 prompt: format!("({} + {}) ÷ {} × {} = ", a, b, c, d),
-                answer: ((a + b) / c * d).to_string(),
+                answer: (q * d).to_string(),
             }
         }
         _ => {
@@ -353,7 +393,7 @@ fn generate_vertical_problem(rng: &mut SimpleRng) -> Problem {
 fn generate_simplified_problem(rng: &mut SimpleRng) -> Problem {
     match rng.gen_range(0, 5) {
         0 => {
-            let mid = [4, 8, 16, 32][rng.gen_range(0, 4)];
+            let mid = [3, 4, 6, 7, 8, 9, 11, 13, 16, 19, 24, 32][rng.gen_range(0, 12)];
             let answer = 25 * mid * 4;
             Problem {
                 prompt: format!("25 × {} × 4 = ", mid),
@@ -384,7 +424,9 @@ fn generate_simplified_problem(rng: &mut SimpleRng) -> Problem {
             }
         }
         _ => {
-            let value = [12.5, 24.5, 36.5][rng.gen_range(0, 3)];
+            let value = [
+                12.5, 14.5, 17.5, 22.5, 24.5, 27.5, 32.5, 36.5, 42.5, 52.5, 62.5, 72.5,
+            ][rng.gen_range(0, 12)];
             Problem {
                 prompt: format!("{} + 7.5 = ", format_decimal(value)),
                 answer: format_decimal(value + 7.5),
@@ -418,12 +460,20 @@ fn generate_conversion_problem(rng: &mut SimpleRng) -> Problem {
             }
         }
         3 => {
-            let items = ["3/4, 0.76, 78%", "2/5, 0.38, 41%", "5/8, 0.6, 63%"];
-            let answer = ["3/4 < 0.76 < 78%", "0.38 < 2/5 < 41%", "0.6 < 5/8 < 63%"];
-            let index = rng.gen_range(0, items.len());
+            let items = [
+                ("3/4, 0.76, 78%", "3/4 < 0.76 < 78%"),
+                ("2/5, 0.38, 41%", "0.38 < 2/5 < 41%"),
+                ("5/8, 0.6, 63%", "0.6 < 5/8 < 63%"),
+                ("1/2, 0.45, 55%", "0.45 < 1/2 < 55%"),
+                ("7/10, 0.65, 72%", "0.65 < 7/10 < 72%"),
+                ("4/5, 0.78, 82%", "0.78 < 4/5 < 82%"),
+                ("3/8, 0.4, 36%", "36% < 3/8 < 0.4"),
+                ("9/20, 0.5, 48%", "9/20 < 48% < 0.5"),
+            ];
+            let (prompt, answer) = items[rng.gen_range(0, items.len())];
             Problem {
-                prompt: format!("比较大小：{}", items[index]),
-                answer: answer[index].to_string(),
+                prompt: format!("比较大小：{}", prompt),
+                answer: answer.to_string(),
             }
         }
         _ => {
@@ -449,11 +499,19 @@ fn generate_ratio_problem(rng: &mut SimpleRng) -> Problem {
             }
         }
         1 => {
-            let left = 0.6;
-            let right = Fraction::new(3, 5);
+            let pairs: [(f64, Fraction); 6] = [
+                (0.6, Fraction::new(3, 5)),
+                (0.5, Fraction::new(1, 4)),
+                (0.75, Fraction::new(3, 8)),
+                (0.4, Fraction::new(1, 5)),
+                (0.3, Fraction::new(3, 5)),
+                (0.8, Fraction::new(2, 5)),
+            ];
+            let (left, right) = pairs[rng.gen_range(0, pairs.len())];
+            let ratio = left / right.to_f64();
             Problem {
                 prompt: format!("{} : {} 求比值", format_decimal(left), right),
-                answer: "1".to_string(),
+                answer: format_decimal(ratio),
             }
         }
         2 => {
@@ -904,6 +962,123 @@ impl SimpleRng {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn direct_subtractions_avoid_degenerate_answers() {
+        // Catches two related bugs in the Direct "_" arm:
+        //   - Fraction::new(N, N) collapsing to "1" caused negative results
+        //     (e.g. "1 - 2 = -1" came from 5/5 - 2/5).
+        //   - Same numerator on both sides yielded "X - X = 0".
+        // Skip percentage-style subtractions ("180 - 30% × 180") which legitimately
+        // use the minus sign without belonging to that arm.
+        for seed in [1_u64, 42, 20260330, 0xCAFE_BABE_u64, 0xDEAD_BEEF_u64] {
+            let config = WorksheetConfig {
+                seed,
+                ..WorksheetConfig::default()
+            };
+            let worksheet = generate_worksheet(&config);
+            for section in &worksheet.sections {
+                if section.kind != SectionKind::Direct {
+                    continue;
+                }
+                for problem in &section.problems {
+                    if problem.prompt.contains('%') || !problem.prompt.contains(" - ") {
+                        continue;
+                    }
+                    assert!(
+                        !problem.answer.starts_with('-'),
+                        "seed {seed}: negative answer in Direct subtraction: {} = {}",
+                        problem.prompt,
+                        problem.answer
+                    );
+                    assert_ne!(
+                        problem.answer, "0",
+                        "seed {seed}: zero answer in Direct subtraction: {} = {}",
+                        problem.prompt, problem.answer
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vertical_paren_div_mul_division_is_exact() {
+        // Catches the (a+b) ÷ c × d arm using integer truncation. We force a
+        // vertical-only worksheet with enough problems to hit the arm repeatedly
+        // and parse the prompt back to verify exactness.
+        for seed in [1_u64, 42, 20260330, 0xCAFE_BABE_u64] {
+            let config = WorksheetConfig {
+                seed,
+                counts: [0, 30, 0, 0, 0],
+                ..WorksheetConfig::default()
+            };
+            let worksheet = generate_worksheet(&config);
+            for section in &worksheet.sections {
+                for problem in &section.problems {
+                    let trimmed = problem.prompt.trim_end_matches('=').trim();
+                    let Some(rest) = trimmed.strip_prefix('(') else {
+                        continue;
+                    };
+                    let Some((a_str, rest)) = rest.split_once(" + ") else {
+                        continue;
+                    };
+                    let Some((b_str, rest)) = rest.split_once(") ÷ ") else {
+                        continue;
+                    };
+                    let Some((c_str, d_str)) = rest.split_once(" × ") else {
+                        continue;
+                    };
+                    let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                        a_str.parse::<i64>(),
+                        b_str.parse::<i64>(),
+                        c_str.parse::<i64>(),
+                        d_str.parse::<i64>(),
+                    ) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        (a + b) % c,
+                        0,
+                        "seed {seed}: non-exact division in {} = {}",
+                        problem.prompt,
+                        problem.answer
+                    );
+                    let expected = (a + b) / c * d;
+                    let actual: i64 = problem.answer.parse().unwrap_or(i64::MIN);
+                    assert_eq!(
+                        expected, actual,
+                        "seed {seed}: wrong answer for {} (expected {expected})",
+                        problem.prompt
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worksheet_problems_are_unique_within_each_section() {
+        // Default counts (24/11/11/8/8) exercise every section's pool size.
+        // Several deterministic seeds catch RNG-specific collision patterns.
+        for seed in [1_u64, 20260330, 99_999, 0xDEAD_BEEF] {
+            let config = WorksheetConfig {
+                seed,
+                ..WorksheetConfig::default()
+            };
+            let worksheet = generate_worksheet(&config);
+            for section in &worksheet.sections {
+                let mut seen = HashSet::new();
+                for problem in &section.problems {
+                    assert!(
+                        seen.insert(problem.prompt.clone()),
+                        "duplicate prompt in section {:?} (seed {}): {}",
+                        section.kind,
+                        seed,
+                        problem.prompt,
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn worksheet_generation_respects_zero_counts() {
